@@ -148,7 +148,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         })
         root.addView(settingsPanel, LinearLayout.LayoutParams(-1, -2))
         setContentView(ScrollView(this).apply {
-            fillViewport = true
+            isFillViewport = true
             addView(root)
         })
         if (getKey().isBlank()) {

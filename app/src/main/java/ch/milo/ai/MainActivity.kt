@@ -8,6 +8,12 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.RadialGradient
+import android.graphics.Shader
+import android.view.animation.DecelerateInterpolator
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
@@ -35,7 +41,7 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : Activity(), TextToSpeech.OnInitListener {
-    private lateinit var face: TextView
+    private lateinit var face: MiloFaceView
     private lateinit var status: TextView
     private lateinit var toggle: Button
     private lateinit var keyField: EditText
@@ -49,12 +55,16 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private var busy = false
     private var speaking = false
     private var ttsReady = false
+    private var requestGeneration = 0
+    private var paused = false
     private val ui = Handler(Looper.getMainLooper())
     private val history = JSONArray()
     private lateinit var transcriptPanel: LinearLayout
     private lateinit var transcriptText: TextView
     private var transcriptVisible = false
     private val archiveKey = "conversation_archive_v21"
+    private val defaultProfile = """Du heisst Milo. Antworte natürlich, direkt und auf Deutsch (Schweiz).
+Beruflicher Kontext: Der Nutzer arbeitet bei Sunrise im Schweizer B2B-Partnergeschäft als Partner Key Account Manager und Deputy Head of Indirect Sales. Er akquiriert, qualifiziert, onboardet und betreut ICT- und Telekommunikationspartner. Zu seinen typischen Aufgaben gehören Partnerprogramm und Vertragsprozesse, Partnerkommunikation, Salesforce-Pipeline, DocuSign, Onboarding, Partnerzugänge, Geschäftskundenlösungen und interne Abstimmungen. Er bevorzugt konkrete, professionelle, kurze E-Mails, klare Zusammenfassungen und umsetzbare nächste Schritte. Bei Sunrise-Fragen sollst du diese Rolle berücksichtigen, aber keine vertraulichen Zahlen, Kundendaten, Vertragsbedingungen oder internen Richtlinien erfinden. Frage nach fehlenden Fakten, wenn sie entscheidend sind. Verwende für aktuelle Informationen die Websuche und kennzeichne Unsicherheit."""
     private fun loadArchive() {
         try {
             val saved = JSONArray(prefs.getString(archiveKey, "[]"))
@@ -94,6 +104,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Seed local profile once; never publish personal data in source-control history.
+        if (!prefs.contains("profile")) prefs.edit().putString("profile", defaultProfile).apply()
         loadArchive()
         tts = TextToSpeech(this, this)
         val root = LinearLayout(this).apply {
@@ -118,9 +130,9 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         header.addView(settingsButton, LinearLayout.LayoutParams(dp(54), dp(52)))
         root.addView(header, LinearLayout.LayoutParams(-1, -2))
-        root.addView(text("Dein persönlicher KI-Begleiter", 14f).apply { setTextColor(Color.LTGRAY) })
-        face = text("●       ●", 76f).apply { setTextColor(cyan) }
-        root.addView(face, LinearLayout.LayoutParams(-1, dp(260)))
+        root.addView(text("DEIN KI-BEGLEITER  •  ONLINE", 12f).apply { setTextColor(cyan); letterSpacing = 0.15f })
+        face = MiloFaceView(this)
+        root.addView(face, LinearLayout.LayoutParams(-1, dp(290)))
         status = text("Milo ist bereit.", 18f)
         root.addView(status, LinearLayout.LayoutParams(-1, dp(96)))
         toggle = Button(this).apply {
@@ -128,6 +140,40 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             setOnClickListener { if (enabled) stopConversation() else beginConversation() }
         }
         root.addView(toggle, LinearLayout.LayoutParams(-1, dp(60)))
+        val interrupt = Button(this).apply {
+            text = "ANTWORT STOPPEN  /  MIKROFON PAUSIEREN"
+            setOnClickListener {
+                when {
+                    speaking -> {
+                        tts?.stop()
+                        speaking = false
+                        ui.removeCallbacks(restart)
+                        status.text = "Unterbrochen. Du kannst jetzt sprechen."
+                        if (enabled) ui.postDelayed(restart, 350)
+                    }
+                    busy -> {
+                        requestGeneration++ // ignore response from in-flight request
+                        busy = false
+                        status.text = "Recherche abgebrochen. Ich höre wieder zu."
+                        if (enabled) ui.postDelayed(restart, 350)
+                    }
+                    enabled -> {
+                        paused = !paused
+                        if (paused) {
+                            ui.removeCallbacks(restart)
+                            recognizer?.cancel()
+                            listening = false
+                            status.text = "Zuhören pausiert. Nochmals tippen zum Fortsetzen."
+                        } else {
+                            status.text = "Ich höre wieder zu …"
+                            ui.postDelayed(restart, 350)
+                        }
+                    }
+                    else -> status.text = "Starte Milo zuerst."
+                }
+            }
+        }
+        root.addView(interrupt, LinearLayout.LayoutParams(-1, dp(55)))
         root.addView(text("Tippe einmal, um freihändig zu sprechen.", 12f).apply {
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(10), 0, dp(18))
@@ -162,14 +208,21 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 } catch (e: Exception) { status.text = "Speichern fehlgeschlagen: ${e.localizedMessage}" }
             }
         })
-        settingsPanel.addView(text("Persönliches Profil", 13f))
+        settingsPanel.addView(text("Berufliches Sunrise-Profil (nur lokal gespeichert)", 13f))
         profileField = EditText(this).apply {
-            setText(prefs.getString("profile", "Ich heisse Claudio. Sprich mit mir auf Deutsch (Schweiz), natürlich und direkt. Du heisst Milo."))
+            setText(prefs.getString("profile", defaultProfile))
             minLines = 2
             maxLines = 5
             setTextColor(Color.WHITE)
         }
         settingsPanel.addView(profileField, LinearLayout.LayoutParams(-1, -2))
+        settingsPanel.addView(Button(this).apply {
+            text = "SUNRISE-GRUNDWISSEN EINFÜGEN"
+            setOnClickListener {
+                profileField.setText(defaultProfile)
+                status.text = "Sunrise-Grundwissen eingefügt. Bitte PROFIL SPEICHERN tippen."
+            }
+        })
         settingsPanel.addView(Button(this).apply {
             text = "PROFIL SPEICHERN"
             setOnClickListener {
@@ -228,13 +281,14 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             override fun run() {
                 if (!isFinishing) {
                     tick++
-                    face.text = when {
-                        tick % 17 == 0 -> "—       —"
-                        speaking -> "◉       ◉"
-                        busy -> "◌       ◌"
-                        listening -> "●       ●"
-                        else -> "•       •"
+                    face.mode = when {
+                        speaking -> 3
+                        busy -> 2
+                        listening -> 1
+                        else -> 0
                     }
+                    face.frame = tick
+                    face.invalidate()
                     ui.postDelayed(this, 250)
                 }
             }
@@ -253,9 +307,10 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         if (!ttsReady) { status.text = "Sprachausgabe wird vorbereitet. Bitte erneut versuchen."; return }
         enabled = true
+        paused = false
         toggle.text = "MILO STOPPEN"
         settingsPanel.visibility = View.GONE
-        speak("Hallo Claudio! Ich bin Milo. Was beschäftigt dich heute?")
+        speak("Hallo! Ich bin Milo. Was beschäftigt dich heute?")
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -265,6 +320,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun stopConversation() {
         enabled = false; listening = false; busy = false; speaking = false
+        paused = false
+        requestGeneration++
         ui.removeCallbacks(restart)
         recognizer?.cancel(); recognizer?.destroy(); recognizer = null
         tts?.stop()
@@ -273,7 +330,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun startListening() {
-        if (!enabled || speaking || busy || listening || isFinishing) return
+        if (!enabled || paused || speaking || busy || listening || isFinishing) return
         recognizer?.destroy()
         recognizer = SpeechRecognizer.createSpeechRecognizer(this)
         recognizer?.setRecognitionListener(object : RecognitionListener {
@@ -284,7 +341,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             override fun onEndOfSpeech() { status.text = "Einen Moment …" }
             override fun onError(error: Int) {
                 listening = false
-                if (enabled && !busy && !speaking) ui.postDelayed(restart, if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1600 else 850)
+                if (enabled && !paused && !busy && !speaking) ui.postDelayed(restart, if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1600 else 850)
             }
             override fun onResults(results: Bundle?) {
                 listening = false
@@ -306,46 +363,84 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun askAI(words: String) {
         busy = true
-        status.text = "Milo denkt …"
+        ui.removeCallbacks(restart)
+        recognizer?.cancel()
+        listening = false
+        status.text = "Milo recherchiert und denkt …"
+        val generation = ++requestGeneration
         val key = getKey()
-        val profile = prefs.getString("profile", "Ich heisse Claudio.").orEmpty()
-        val messages = JSONArray().put(JSONObject().put("role", "system").put("content", "Du bist Milo, ein freundlicher persönlicher KI-Begleiter. Antworte auf Deutsch (Schweiz), natürlich, prägnant und mündlich gut verständlich. Nutzerprofil: $profile"))
+        val profile = prefs.getString("profile", defaultProfile).orEmpty()
+        val instructions = """Du bist Milo, ein persönlicher KI-Assistent. Sprich Deutsch (Schweiz), natürlich und direkt.
+Du hast Zugriff auf die Websuche. Bei aktuellen Fakten, konkreten Firmen, Ersatzteilen, Preisen, Angeboten und Quellen recherchiere selbst, statt nur Suchanleitungen zu geben. Behaupte keine Recherche, wenn keine stattgefunden hat. Gib konkrete Resultate, sofern verifizierbar. Antworte standardmässig in 2 bis 3 kurzen Sätzen und maximal ungefähr 65 Wörtern. Beginne mit der konkreten Antwort, ohne Einleitung oder Wiederholung der Frage. Bei Produktsuche nenne zuerst Teilenummer, Anbieter und Preis, falls verifiziert. Wenn der Nutzer ausdrücklich Details verlangt, antworte ausführlicher. Quellen-URLs können im Chatverlauf stehen.
+Persönlicher Kontext (vom Nutzer lokal verwaltet):
+$profile"""
+        val input = JSONArray()
         val from = maxOf(0, history.length() - 12)
-        for (i in from until history.length()) messages.put(history.getJSONObject(i))
-        messages.put(JSONObject().put("role", "user").put("content", words))
+        for (i in from until history.length()) {
+            val old = history.optJSONObject(i) ?: continue
+            input.put(JSONObject().put("role", old.optString("role")).put("content", old.optString("content")))
+        }
+        input.put(JSONObject().put("role", "user").put("content", words))
         Thread {
-            var answer: String
+            var answer = ""
             var success = false
+            var connection: HttpURLConnection? = null
             try {
-                val connection = (URL("https://api.openai.com/v1/chat/completions").openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"; connectTimeout = 20000; readTimeout = 45000
+                connection = (URL("https://api.openai.com/v1/responses").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 20000
+                    readTimeout = 90000
                     setRequestProperty("Authorization", "Bearer $key")
                     setRequestProperty("Content-Type", "application/json")
                     doOutput = true
                 }
-                val payload = JSONObject().put("model", "gpt-4o-mini").put("messages", messages).put("max_tokens", 300)
+                val payload = JSONObject()
+                    .put("model", "gpt-4.1-mini")
+                    .put("instructions", instructions)
+                    .put("input", input)
+                    .put("tools", JSONArray().put(JSONObject().put("type", "web_search_preview")))
+                    .put("max_output_tokens", 450)
                 connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
                 val code = connection.responseCode
-                val response = (if (code in 200..299) connection.inputStream else connection.errorStream).bufferedReader().use { it.readText() }
-                if (code !in 200..299) throw Exception("API-Fehler $code: " + JSONObject(response).optJSONObject("error")?.optString("message", "Unbekannt"))
-                answer = JSONObject(response).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content").trim()
+                val response = (if (code in 200..299) connection.inputStream else connection.errorStream)
+                    ?.bufferedReader()?.use { it.readText() }.orEmpty()
+                if (code !in 200..299) {
+                    val detail = try { JSONObject(response).optJSONObject("error")?.optString("message") } catch (_: Exception) { null }
+                    throw Exception("API $code: ${detail ?: response.take(180)}")
+                }
+                val output = JSONObject(response).optJSONArray("output") ?: JSONArray()
+                val parts = mutableListOf<String>()
+                for (i in 0 until output.length()) {
+                    val item = output.optJSONObject(i) ?: continue
+                    if (item.optString("type") != "message") continue
+                    val content = item.optJSONArray("content") ?: continue
+                    for (j in 0 until content.length()) {
+                        val part = content.optJSONObject(j) ?: continue
+                        if (part.optString("type") == "output_text") parts.add(part.optString("text"))
+                    }
+                }
+                answer = parts.joinToString("\n").trim()
+                if (answer.isBlank()) throw Exception("Keine Textantwort erhalten.")
                 success = true
-                connection.disconnect()
-            } catch (e: Exception) { answer = "Verbindung fehlgeschlagen: ${e.localizedMessage}" }
+            } catch (e: Exception) {
+                answer = "Recherche fehlgeschlagen: ${e.localizedMessage}"
+            } finally { connection?.disconnect() }
             val ok = success
             ui.post {
-                if (!enabled) return@post
+                if (!enabled || generation != requestGeneration) return@post
                 busy = false
                 if (ok) {
                     history.put(JSONObject().put("role", "user").put("content", words))
                     history.put(JSONObject().put("role", "assistant").put("content", answer))
                     saveArchive()
                     refreshTranscript()
-                    speak(answer)
+                    // Keep the spoken answer shorter; full text remains available in transcript.
+                    val spoken = answer.replace(Regex("https?://\\S+"), "Link im Gesprächsverlauf")
+                    speak(spoken.take(650))
                 } else {
                     status.text = answer
-                    if (answer.contains("401") || answer.contains("429")) stopConversation()
-                    else ui.postDelayed(restart, 1700)
+                    if (answer.contains("API 401") || answer.contains("API 429")) stopConversation()
+                    else if (!paused) ui.postDelayed(restart, 1700)
                 }
             }
         }.start()
@@ -357,7 +452,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val result = tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "milo_answer")
         if (result != TextToSpeech.SUCCESS) {
             speaking = false
-            if (enabled) ui.postDelayed(restart, 1000)
+            if (enabled && !paused) ui.postDelayed(restart, 1000)
         }
     }
 
@@ -365,11 +460,12 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         if (code == TextToSpeech.SUCCESS) {
             ttsReady = true
             tts?.language = Locale.forLanguageTag("de-CH")
+            tts?.setSpeechRate(1.18f)
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) { ui.post { speaking = false; if (enabled) ui.postDelayed(restart, 550) } }
+                override fun onDone(utteranceId: String?) { ui.post { speaking = false; if (enabled && !paused) ui.postDelayed(restart, 550) } }
                 @Deprecated("Deprecated Android callback")
-                override fun onError(utteranceId: String?) { ui.post { speaking = false; if (enabled) ui.postDelayed(restart, 550) } }
+                override fun onError(utteranceId: String?) { ui.post { speaking = false; if (enabled && !paused) ui.postDelayed(restart, 550) } }
             })
         }
     }
@@ -401,3 +497,111 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     override fun onDestroy() { stopConversation(); tts?.shutdown(); super.onDestroy() }
 }
 
+
+/** Animated, entirely vector-drawn face. No image files, dependencies or permissions. */
+private class MiloFaceView(context: Context) : View(context) {
+    var mode: Int = 0 // 0 idle, 1 listening, 2 thinking, 3 speaking
+    var frame: Int = 0
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val eye = Color.rgb(93, 238, 244)
+    private val navy = Color.rgb(9, 17, 32)
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val cx = w / 2f
+        val cy = h * 0.48f
+        val r = minOf(w * 0.39f, h * 0.46f)
+        val time = frame * 0.25f
+        val pulse = (kotlin.math.sin(time * 0.9f) * 0.5f + 0.5f).toFloat()
+
+        // Atmospheric halo and circular robot silhouette
+        p.shader = RadialGradient(cx, cy, r * 1.35f,
+            intArrayOf(Color.argb(75, 23, 191, 213), Color.argb(26, 22, 88, 139), Color.TRANSPARENT),
+            null, Shader.TileMode.CLAMP)
+        canvas.drawCircle(cx, cy, r * 1.35f, p)
+        p.shader = null
+        p.style = Paint.Style.FILL
+        p.color = Color.rgb(13, 30, 52)
+        canvas.drawCircle(cx, cy, r * 0.93f, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = r * 0.018f
+        p.color = Color.argb(155, 57, 183, 211)
+        canvas.drawCircle(cx, cy, r * 0.95f, p)
+        p.color = Color.argb(90, 56, 122, 172)
+        p.strokeWidth = r * 0.007f
+        canvas.drawCircle(cx, cy, r * 1.06f + pulse * r * 0.018f, p)
+        p.style = Paint.Style.FILL
+
+        // Small orbiting light nodes
+        for (i in 0 until 5) {
+            val a = i * (Math.PI * 2 / 5) + time * 0.12
+            val x = cx + kotlin.math.cos(a).toFloat() * r * 1.055f
+            val y = cy + kotlin.math.sin(a).toFloat() * r * 1.055f
+            p.color = Color.argb(100 + (pulse * 80).toInt(), 77, 225, 240)
+            canvas.drawCircle(x, y, r * 0.015f, p)
+        }
+
+        // Brow: expressive arcs
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = r * 0.027f
+        p.strokeCap = Paint.Cap.ROUND
+        p.color = Color.argb(170, 68, 171, 197)
+        val browY = cy - r * 0.33f
+        canvas.drawArc(RectF(cx - r * 0.64f, browY - r * 0.10f, cx - r * 0.13f, browY + r * 0.12f), 195f, 145f, false, p)
+        canvas.drawArc(RectF(cx + r * 0.13f, browY - r * 0.10f, cx + r * 0.64f, browY + r * 0.12f), 200f, 145f, false, p)
+        p.style = Paint.Style.FILL
+
+        val blink = frame % 79 == 0 || frame % 79 == 1
+        val eyeH = if (blink) r * 0.025f else when(mode) {
+            1 -> r * 0.29f
+            2 -> r * 0.19f + pulse * r * 0.08f
+            3 -> r * 0.26f
+            else -> r * 0.24f
+        }
+        val eyeW = r * 0.26f
+        val eyeY = cy - r * 0.07f
+        for (offset in listOf(-0.39f, 0.39f)) {
+            val x = cx + r * offset
+            p.color = Color.argb(40, 55, 232, 240)
+            canvas.drawRoundRect(RectF(x - eyeW * 0.67f, eyeY - eyeH * 0.72f,
+                x + eyeW * 0.67f, eyeY + eyeH * 0.72f), eyeW, eyeW, p)
+            p.color = eye
+            canvas.drawRoundRect(RectF(x - eyeW * 0.49f, eyeY - eyeH * 0.5f,
+                x + eyeW * 0.49f, eyeY + eyeH * 0.5f), eyeW, eyeW, p)
+            if (!blink) {
+                p.color = Color.WHITE
+                canvas.drawCircle(x - eyeW * 0.13f, eyeY - eyeH * 0.16f, r * 0.025f, p)
+            }
+        }
+
+        // Speaking: animated equalizer mouth; idle: curved smile
+        val mouthY = cy + r * 0.42f
+        if (mode == 3 || mode == 2) {
+            val heights = floatArrayOf(0.10f, 0.19f, 0.27f, 0.19f, 0.10f)
+            for (i in heights.indices) {
+                val wave = 0.55f + 0.45f * kotlin.math.abs(kotlin.math.sin(time * 2.3 + i * 0.9)).toFloat()
+                val bh = r * heights[i] * (if (mode == 3) wave else 0.4f + pulse * 0.4f)
+                val bx = cx + (i - 2) * r * 0.14f
+                p.color = eye
+                canvas.drawRoundRect(RectF(bx - r * 0.035f, mouthY - bh / 2,
+                    bx + r * 0.035f, mouthY + bh / 2), r * 0.03f, r * 0.03f, p)
+            }
+        } else {
+            p.style = Paint.Style.STROKE
+            p.strokeCap = Paint.Cap.ROUND
+            p.strokeWidth = r * 0.032f
+            p.color = eye
+            canvas.drawArc(RectF(cx - r * 0.25f, mouthY - r * 0.13f,
+                cx + r * 0.25f, mouthY + r * 0.13f), 15f, 150f, false, p)
+            p.style = Paint.Style.FILL
+        }
+        // Listening indicator at forehead
+        if (mode == 1) {
+            p.color = eye
+            canvas.drawCircle(cx, cy - r * 0.66f, r * (0.024f + pulse * 0.013f), p)
+        }
+    }
+}

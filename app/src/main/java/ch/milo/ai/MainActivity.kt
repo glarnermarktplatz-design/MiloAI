@@ -3,6 +3,9 @@ package ch.milo.ai
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -48,6 +51,34 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private var ttsReady = false
     private val ui = Handler(Looper.getMainLooper())
     private val history = JSONArray()
+    private lateinit var transcriptPanel: LinearLayout
+    private lateinit var transcriptText: TextView
+    private var transcriptVisible = false
+    private val archiveKey = "conversation_archive_v21"
+    private fun loadArchive() {
+        try {
+            val saved = JSONArray(prefs.getString(archiveKey, "[]"))
+            for (i in 0 until saved.length()) history.put(saved.getJSONObject(i))
+        } catch (_: Exception) { /* Invalid archive: start empty */ }
+    }
+    private fun saveArchive() { prefs.edit().putString(archiveKey, history.toString()).apply() }
+    private fun transcript(): String {
+        val lines = mutableListOf<String>()
+        for (i in 0 until history.length()) {
+            val msg = history.optJSONObject(i) ?: continue
+            val who = if (msg.optString("role") == "user") "Du" else "Milo"
+            lines.add("$who: ${msg.optString("content")}")
+        }
+        return lines.joinToString("\n\n")
+    }
+    private fun refreshTranscript() {
+        if (::transcriptText.isInitialized) transcriptText.text = transcript().ifBlank { "Noch keine Gespräche gespeichert." }
+    }
+    private fun copyText(value: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Milo Gespräch", value))
+        Toast.makeText(this, "Text kopiert", Toast.LENGTH_SHORT).show()
+    }
     private val prefs by lazy { getSharedPreferences("milo", MODE_PRIVATE) }
     private val dark = Color.rgb(9, 17, 32)
     private val cyan = Color.rgb(95, 227, 240)
@@ -63,6 +94,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        loadArchive()
         tts = TextToSpeech(this, this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -147,6 +179,42 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             }
         })
         root.addView(settingsPanel, LinearLayout.LayoutParams(-1, -2))
+        val transcriptToggle = Button(this).apply {
+            text = "GESPRÄCHSVERLAUF ANZEIGEN"
+            setOnClickListener {
+                transcriptVisible = !transcriptVisible
+                transcriptPanel.visibility = if (transcriptVisible) View.VISIBLE else View.GONE
+                text = if (transcriptVisible) "GESPRÄCHSVERLAUF SCHLIESSEN" else "GESPRÄCHSVERLAUF ANZEIGEN"
+                refreshTranscript()
+            }
+        }
+        root.addView(transcriptToggle, LinearLayout.LayoutParams(-1, dp(54)))
+        transcriptPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(4), dp(12), dp(4), dp(16))
+        }
+        transcriptText = text("", 15f).apply {
+            gravity = Gravity.START
+            setTextIsSelectable(true) // Long press selects and copies individual messages/text
+        }
+        transcriptPanel.addView(transcriptText, LinearLayout.LayoutParams(-1, -2))
+        transcriptPanel.addView(Button(this).apply {
+            text = "GANZES GESPRÄCH KOPIEREN"
+            setOnClickListener { copyText(transcript()) }
+        })
+        transcriptPanel.addView(Button(this).apply {
+            text = "NEUES GESPRÄCH"
+            setOnClickListener {
+                stopConversation()
+                historyClear()
+                saveArchive()
+                refreshTranscript()
+                status.text = "Neues Gespräch bereit. Bisheriger Verlauf wurde gelöscht."
+            }
+        })
+        root.addView(transcriptPanel, LinearLayout.LayoutParams(-1, -2))
+        refreshTranscript()
         setContentView(ScrollView(this).apply {
             isFillViewport = true
             addView(root)
@@ -171,6 +239,10 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 }
             }
         })
+    }
+
+    private fun historyClear() {
+        while (history.length() > 0) history.remove(history.length() - 1)
     }
 
     private fun beginConversation() {
@@ -238,7 +310,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val key = getKey()
         val profile = prefs.getString("profile", "Ich heisse Claudio.").orEmpty()
         val messages = JSONArray().put(JSONObject().put("role", "system").put("content", "Du bist Milo, ein freundlicher persönlicher KI-Begleiter. Antworte auf Deutsch (Schweiz), natürlich, prägnant und mündlich gut verständlich. Nutzerprofil: $profile"))
-        for (i in 0 until history.length()) messages.put(history.getJSONObject(i))
+        val from = maxOf(0, history.length() - 12)
+        for (i in from until history.length()) messages.put(history.getJSONObject(i))
         messages.put(JSONObject().put("role", "user").put("content", words))
         Thread {
             var answer: String
@@ -266,7 +339,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 if (ok) {
                     history.put(JSONObject().put("role", "user").put("content", words))
                     history.put(JSONObject().put("role", "assistant").put("content", answer))
-                    while (history.length() > 12) history.remove(0)
+                    saveArchive()
+                    refreshTranscript()
                     speak(answer)
                 } else {
                     status.text = answer
@@ -326,3 +400,4 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() { stopConversation(); tts?.shutdown(); super.onDestroy() }
 }
+
